@@ -278,15 +278,70 @@ try:
                 })
         df_exp = pd.DataFrame(exp_rows)
 
+        # ── STEP 5b : Build per-HSN B2B/B2C proportion table (for Option A) ────
+        # Govt HSN sheet is combined (B2B+B2C). To compare B2B detail vs Govt
+        # fairly, we derive the B2B share = (Tally B2B taxable / Tally total
+        # taxable) × Govt total for each HSN. Same logic for B2C share.
+        _hsn_tally_total = (
+            df_exp.groupby("HSN")["GST SALES"].sum()
+            .rename("tally_total_tax").reset_index()
+        )
+        _hsn_b2b_total = (
+            df_exp[df_exp["is_b2b"]].groupby("HSN")["GST SALES"].sum()
+            .rename("tally_b2b_tax").reset_index()
+        )
+        _hsn_b2c_total = (
+            df_exp[~df_exp["is_b2b"]].groupby("HSN")["GST SALES"].sum()
+            .rename("tally_b2c_tax").reset_index()
+        )
+        _hsn_prop = _hsn_tally_total.merge(_hsn_b2b_total, on="HSN", how="left") \
+                                    .merge(_hsn_b2c_total, on="HSN", how="left").fillna(0)
+        _hsn_prop["prop_b2b"] = _hsn_prop.apply(
+            lambda r: r["tally_b2b_tax"] / r["tally_total_tax"] if r["tally_total_tax"] > 0 else 0, axis=1
+        )
+        _hsn_prop["prop_b2c"] = _hsn_prop.apply(
+            lambda r: r["tally_b2c_tax"] / r["tally_total_tax"] if r["tally_total_tax"] > 0 else 0, axis=1
+        )
+        _hsn_prop_dict = _hsn_prop.set_index("HSN")[["prop_b2b","prop_b2c"]].to_dict("index")
+
+        def get_govt_split(hsn_code, g_tot, g_tax, g_cg, g_sg, g_ig, filter_b2b):
+            """
+            OPTION A: When filter_b2b is True/False, scale Govt totals by the
+            Tally B2B/B2C proportion so the comparison is apples-to-apples.
+            When filter_b2b is None (combined view), use full Govt totals.
+            """
+            if filter_b2b is None:
+                return g_tot, g_tax, g_cg, g_sg, g_ig, "Govt HSN Sheet — Full (B2B+B2C)"
+            prop_info = _hsn_prop_dict.get(str(hsn_code), {"prop_b2b": 1.0, "prop_b2c": 0.0})
+            prop = prop_info["prop_b2b"] if filter_b2b else prop_info["prop_b2c"]
+            pct = round(prop * 100, 1)
+            label = "B2B" if filter_b2b else "B2C"
+            note = (
+                f"Govt HSN × {pct}% {label} share (proportional split — "
+                f"Govt doesn't separate B2B/B2C)"
+            )
+            return (
+                round(g_tot * prop, 2), round(g_tax * prop, 2),
+                round(g_cg  * prop, 2), round(g_sg  * prop, 2),
+                round(g_ig  * prop, 2), note,
+            )
+
         # ── STEP 6 : WATERFALL — invoice-level detail rows ────────────────────
         def waterfall_detail(hsn_code, df_exp, govt_hsn_agg, filter_b2b=None):
             ga = govt_hsn_agg[govt_hsn_agg["HSN"] == hsn_code]
             if ga.empty:
                 return []
             g = ga.iloc[0]
-            g_tot = g["Govt_Total"];  g_tax = g["Govt_Taxable"]
-            g_cg = g["Govt_CGST"];   g_sg = g["Govt_SGST"];   g_ig = g["Govt_IGST"]
+            g_tot_full = g["Govt_Total"];  g_tax_full = g["Govt_Taxable"]
+            g_cg_full  = g["Govt_CGST"];   g_sg_full  = g["Govt_SGST"]
+            g_ig_full  = g["Govt_IGST"]
             desc = str(g["Description"]); uqc = str(g["UQC"])
+
+            # ── OPTION A: use proportional Govt split for B2B / B2C detail ──
+            g_tot, g_tax, g_cg, g_sg, g_ig, govt_note = get_govt_split(
+                hsn_code, g_tot_full, g_tax_full, g_cg_full, g_sg_full, g_ig_full,
+                filter_b2b
+            )
 
             inv = df_exp[df_exp["HSN"] == hsn_code].sort_values("Voucher No.").copy()
             if filter_b2b is True:
@@ -295,16 +350,16 @@ try:
                 inv = inv[~inv["is_b2b"]]
 
             singles = inv[~inv["is_multi"]]
-            multis = inv[inv["is_multi"]]
+            multis  = inv[inv["is_multi"]]
 
             s_tot = singles["Gross Total"].sum(); s_tax = singles["GST SALES"].sum()
-            s_cg = singles["CGST"].sum();         s_sg = singles["SGST"].sum()
-            s_ig = singles["IGST"].sum()
-            n_m = len(multis)
+            s_cg  = singles["CGST"].sum();        s_sg  = singles["SGST"].sum()
+            s_ig  = singles["IGST"].sum()
+            n_m   = len(multis)
 
             rem_tot = round(g_tot - s_tot, 2); rem_tax = round(g_tax - s_tax, 2)
-            rem_cg = round(g_cg - s_cg, 2);   rem_sg = round(g_sg - s_sg, 2)
-            rem_ig = round(g_ig - s_ig, 2)
+            rem_cg  = round(g_cg  - s_cg,  2); rem_sg  = round(g_sg  - s_sg,  2)
+            rem_ig  = round(g_ig  - s_ig,  2)
 
             rows = []
             for _, r in singles.iterrows():
@@ -324,9 +379,9 @@ try:
             for _, r in multis.iterrows():
                 pa = round(rem_tot / n_m, 2) if n_m > 0 else 0
                 ta = round(rem_tax / n_m, 2) if n_m > 0 else 0
-                ca = round(rem_cg / n_m, 2) if n_m > 0 else 0
-                sa = round(rem_sg / n_m, 2) if n_m > 0 else 0
-                ia = round(rem_ig / n_m, 2) if n_m > 0 else 0
+                ca = round(rem_cg  / n_m, 2) if n_m > 0 else 0
+                sa = round(rem_sg  / n_m, 2) if n_m > 0 else 0
+                ia = round(rem_ig  / n_m, 2) if n_m > 0 else 0
                 rows.append({
                     "HSN": hsn_code, "Description": desc, "UQC": uqc,
                     "Voucher No.": r["Voucher No."],
@@ -340,9 +395,9 @@ try:
                     "Note": f"Multi-HSN: Govt remaining {rem_tot} ÷ {n_m} invoice(s)",
                 })
 
-            tt = round(s_tot + rem_tot, 2); ttax = round(s_tax + rem_tax, 2)
-            tcg = round(s_cg + rem_cg, 2);  tsg = round(s_sg + rem_sg, 2)
-            tig = round(s_ig + rem_ig, 2)
+            tt   = round(s_tot + rem_tot, 2); ttax = round(s_tax + rem_tax, 2)
+            tcg  = round(s_cg  + rem_cg,  2); tsg  = round(s_sg  + rem_sg,  2)
+            tig  = round(s_ig  + rem_ig,  2)
 
             rows.append({
                 "HSN": hsn_code, "Description": desc, "UQC": uqc,
@@ -354,17 +409,18 @@ try:
             })
             rows.append({
                 "HSN": hsn_code, "Description": desc, "UQC": uqc,
-                "Voucher No.": "── GOVT TOTAL (Final) ──", "Date": "",
-                "Party Name": "", "GSTIN": "", "Type": "", "Multi-HSN": "",
+                "Voucher No.": "── GOVT TOTAL (Proportional) ──" if filter_b2b is not None
+                               else "── GOVT TOTAL (Full) ──",
+                "Date": "", "Party Name": "", "GSTIN": "", "Type": "", "Multi-HSN": "",
                 "Gross Total": g_tot, "Taxable Value": g_tax,
                 "CGST": g_cg, "SGST": g_sg, "IGST": g_ig,
-                "Row Type": "GovtTotal", "Note": "Govt HSN Sheet — Final",
+                "Row Type": "GovtTotal", "Note": govt_note,
             })
 
-            dt = round(tt - g_tot, 2);   dtax = round(ttax - g_tax, 2)
-            dcg = round(tcg - g_cg, 2);  dsg = round(tsg - g_sg, 2)
-            dig = round(tig - g_ig, 2)
-            ok = all(abs(x) < 0.5 for x in [dt, dtax, dcg, dsg, dig])
+            dt   = round(tt   - g_tot,  2); dtax = round(ttax - g_tax, 2)
+            dcg  = round(tcg  - g_cg,   2); dsg  = round(tsg  - g_sg,  2)
+            dig  = round(tig  - g_ig,   2)
+            ok   = all(abs(x) < 0.5 for x in [dt, dtax, dcg, dsg, dig])
             rows.append({
                 "HSN": hsn_code, "Description": desc, "UQC": uqc,
                 "Voucher No.": "✅ MATCH" if ok else "❌ DIFF",
@@ -616,11 +672,11 @@ try:
             auto_width(ws)
 
         write_hsn_detail(wb, df_b2b_hsn,  "B2B HSN Detail",
-                         "B2B HSN — Invoice-wise Waterfall vs Govt HSN")
+                         "B2B HSN — Invoice-wise Waterfall | Govt = Proportional B2B Share (Option A)")
         write_hsn_detail(wb, df_b2c_hsn,  "B2C HSN Detail",
-                         "B2C HSN — Invoice-wise Waterfall vs Govt HSN")
+                         "B2C HSN — Invoice-wise Waterfall | Govt = Proportional B2C Share (Option A)")
         write_hsn_detail(wb, df_combined, "All HSN Combined",
-                         "All HSN (B2B + B2C) — Invoice-wise Waterfall vs Govt HSN")
+                         "All HSN (B2B + B2C) — Invoice-wise Waterfall vs Full Govt HSN")
 
         # HSN Summary sheet writer
         HSN_COLS = [
@@ -634,7 +690,15 @@ try:
             "Central Tax Amount": 18, "State/UT Tax Amount": 18, "Cess Amount": 14,
         }
 
-        def write_hsn_summary(wb, df, sheet_name, title, subtitle):
+        def write_hsn_summary(wb, df, sheet_name, title, subtitle, df_other=None, govt_hsn_agg=None):
+            """
+            OPTION B: Adds a combined Tally (B2B+B2C) vs Govt comparison block
+            below the main summary so the reader can see:
+              • the split (this sheet = B2B or B2C portion)
+              • the combined total that actually ties to Govt HSN
+            df_other  = the partner summary df (if this is B2B, pass df_b2c_hsn_sum)
+            govt_hsn_agg = aggregated govt HSN dataframe
+            """
             ws = wb.create_sheet(sheet_name)
             ws.cell(1, 1, title).font = Font(bold=True, size=13, color="1F4E79")
             ws.merge_cells(
@@ -646,6 +710,7 @@ try:
             )
             hdr(ws, 3, HSN_COLS)
             ws.row_dimensions[3].height = 32
+            next_ri = 4
             for ri, (_, row) in enumerate(df.iterrows(), 4):
                 is_total = str(row.get("HSN", "")) == "TOTAL"
                 fill = FT if is_total else (FALT if ri % 2 == 0 else None)
@@ -666,6 +731,125 @@ try:
                             c.number_format = "#,##0.00"
                     if fill:
                         c.fill = fill
+                next_ri = ri + 1
+
+            # ── OPTION B : Combined Tally (B2B+B2C) vs Govt comparison block ──
+            if df_other is not None and govt_hsn_agg is not None:
+                gap_rows = next_ri + 1  # one blank row gap
+
+                # Header banner
+                banner = ws.cell(gap_rows, 1,
+                    "OPTION B VALIDATION — Combined Tally (B2B + B2C) vs Govt HSN  "
+                    "│  Govt HSN sheet does NOT split B2B/B2C — compare combined totals here")
+                banner.font = Font(bold=True, size=10, color="FFFFFF")
+                banner.fill = PatternFill("solid", fgColor="375623")
+                banner.alignment = Alignment(horizontal="left", vertical="center")
+                ws.merge_cells(start_row=gap_rows, start_column=1,
+                               end_row=gap_rows, end_column=len(HSN_COLS))
+                ws.row_dimensions[gap_rows].height = 22
+                gap_rows += 1
+
+                CMP_COLS = [
+                    "HSN", "Description",
+                    "Tally B2B Taxable", "Tally B2C Taxable", "Tally COMBINED Taxable",
+                    "Govt Taxable", "Diff Taxable",
+                    "Tally B2B CGST", "Tally B2C CGST", "Tally COMBINED CGST",
+                    "Govt CGST", "Diff CGST",
+                    "Status",
+                ]
+                hdr(ws, gap_rows, CMP_COLS, fill=PatternFill("solid", fgColor="375623"))
+                ws.row_dimensions[gap_rows].height = 28
+                gap_rows += 1
+
+                # Build lookup: HSN → this-sheet row, other-sheet row, govt row
+                this_data  = df[df["HSN"].astype(str) != "TOTAL"].set_index("HSN")
+                other_data = df_other[df_other["HSN"].astype(str) != "TOTAL"].set_index("HSN")
+                govt_lookup = govt_hsn_agg.set_index("HSN")
+
+                all_hsns = sorted(set(
+                    list(this_data.index.astype(str)) +
+                    list(other_data.index.astype(str)) +
+                    list(govt_lookup.index.astype(str))
+                ))
+
+                sum_comb_tax = 0; sum_govt_tax = 0
+                sum_comb_cg  = 0; sum_govt_cg  = 0
+                sum_b2b_tax  = 0; sum_b2c_tax  = 0
+                sum_b2b_cg   = 0; sum_b2c_cg   = 0
+
+                for hsn in all_hsns:
+                    t_b2b_tax = float(this_data.loc[hsn, "Taxable Value"])   if hsn in this_data.index  else 0
+                    t_b2c_tax = float(other_data.loc[hsn, "Taxable Value"])  if hsn in other_data.index else 0
+                    t_b2b_cg  = float(this_data.loc[hsn, "Central Tax Amount"])  if hsn in this_data.index  else 0
+                    t_b2c_cg  = float(other_data.loc[hsn, "Central Tax Amount"]) if hsn in other_data.index else 0
+                    g_tax = float(govt_lookup.loc[hsn, "Govt_Taxable"]) if hsn in govt_lookup.index else 0
+                    g_cg  = float(govt_lookup.loc[hsn, "Govt_CGST"])    if hsn in govt_lookup.index else 0
+                    desc  = str(govt_lookup.loc[hsn, "Description"]) if hsn in govt_lookup.index else ""
+
+                    comb_tax = round(t_b2b_tax + t_b2c_tax, 2)
+                    comb_cg  = round(t_b2b_cg  + t_b2c_cg,  2)
+                    diff_tax = round(comb_tax - g_tax, 2)
+                    diff_cg  = round(comb_cg  - g_cg,  2)
+                    ok_row   = abs(diff_tax) < 0.5 and abs(diff_cg) < 0.5
+                    status   = "✅ MATCH" if ok_row else f"❌ DIFF tax={diff_tax} cgst={diff_cg}"
+
+                    sum_b2b_tax += t_b2b_tax; sum_b2c_tax += t_b2c_tax
+                    sum_b2b_cg  += t_b2b_cg;  sum_b2c_cg  += t_b2c_cg
+                    sum_comb_tax += comb_tax;  sum_govt_tax += g_tax
+                    sum_comb_cg  += comb_cg;   sum_govt_cg  += g_cg
+
+                    row_vals = [
+                        hsn, desc,
+                        t_b2b_tax, t_b2c_tax, comb_tax, g_tax, diff_tax,
+                        t_b2b_cg,  t_b2c_cg,  comb_cg,  g_cg,  diff_cg,
+                        status,
+                    ]
+                    row_fill = FG if ok_row else FR
+                    for ci, val in enumerate(row_vals, 1):
+                        c = ws.cell(gap_rows, ci, val)
+                        c.border = thin
+                        c.font   = Font(size=9)
+                        c.fill   = row_fill
+                        c.alignment = Alignment(
+                            horizontal="right" if ci > 2 else "left",
+                            vertical="center"
+                        )
+                        if ci > 2 and ci != len(row_vals):
+                            c.number_format = "#,##0.00"
+                    gap_rows += 1
+
+                # Grand total row
+                grand_diff_tax = round(sum_comb_tax - sum_govt_tax, 2)
+                grand_diff_cg  = round(sum_comb_cg  - sum_govt_cg,  2)
+                grand_ok = abs(grand_diff_tax) < 1 and abs(grand_diff_cg) < 1
+                grand_vals = [
+                    "GRAND TOTAL", "",
+                    round(sum_b2b_tax,2), round(sum_b2c_tax,2), round(sum_comb_tax,2),
+                    round(sum_govt_tax,2), grand_diff_tax,
+                    round(sum_b2b_cg,2),  round(sum_b2c_cg,2),  round(sum_comb_cg,2),
+                    round(sum_govt_cg,2),  grand_diff_cg,
+                    "✅ BALANCED" if grand_ok else f"❌ GAP={grand_diff_tax}",
+                ]
+                for ci, val in enumerate(grand_vals, 1):
+                    c = ws.cell(gap_rows, ci, val)
+                    c.border = thin
+                    c.font   = Font(size=9, bold=True)
+                    c.fill   = FT
+                    c.alignment = Alignment(
+                        horizontal="right" if ci > 2 else "left",
+                        vertical="center"
+                    )
+                    if ci > 2 and ci != len(grand_vals):
+                        c.number_format = "#,##0.00"
+
+                # Auto-width for the wider comparison columns
+                for ci in range(1, len(CMP_COLS)+1):
+                    col_letter = get_column_letter(ci)
+                    if ws.column_dimensions[col_letter].width < 16:
+                        ws.column_dimensions[col_letter].width = 16
+                ws.column_dimensions["A"].width = 14
+                ws.column_dimensions["B"].width = 30
+
             for ci, col in enumerate(HSN_COLS, 1):
                 ws.column_dimensions[get_column_letter(ci)].width = COL_W.get(col, 14)
             ws.freeze_panes = "A4"
@@ -673,12 +857,14 @@ try:
         write_hsn_summary(
             wb, df_b2b_hsn_sum, "HSN B2B Summary",
             "HSN Summary — B2B Invoices (Tally Waterfall Allocation)",
-            "HSN-wise clubbed totals for B2B | Govt HSN = Final cap",
+            "HSN-wise clubbed totals for B2B | Scroll down for combined B2B+B2C vs Govt validation",
+            df_other=df_b2c_hsn_sum, govt_hsn_agg=govt_hsn_agg,
         )
         write_hsn_summary(
             wb, df_b2c_hsn_sum, "HSN B2C Summary",
             "HSN Summary — B2C Invoices (Tally Waterfall Allocation)",
-            "HSN-wise clubbed totals for B2C (blank GSTIN) | Govt HSN = Final cap",
+            "HSN-wise clubbed totals for B2C (blank GSTIN) | Scroll down for combined B2B+B2C vs Govt validation",
+            df_other=df_b2b_hsn_sum, govt_hsn_agg=govt_hsn_agg,
         )
 
         # Sheet 9 — Govt HSN Reference
@@ -704,6 +890,27 @@ try:
             ("🟩 Light Green band (HSN)", "Tally Total row for that HSN"),
             ("🟦 Light Blue band (HSN)", "Govt Total row — FINAL"),
             ("🟢 / 🔴 Diff row (HSN)", "0 = perfect match | non-zero = gap"),
+            ("", ""),
+            ("WHY GOVT HSN ≠ B2B or B2C ALONE", ""),
+            ("Key fact",
+             "Govt HSN sheet is a COMBINED total (B2B + B2C). It does NOT split by customer type."),
+            ("", ""),
+            ("OPTION A — Proportional Govt Split (B2B/B2C Detail sheets)", ""),
+            ("What it does",
+             "In B2B HSN Detail / B2C HSN Detail: Govt Total is scaled by the "
+             "proportion of B2B (or B2C) taxable value vs total Tally taxable value for that HSN."),
+            ("Example",
+             "HSN 84151010: B2B = 73.85% of Tally total. Govt 12,33,042 × 73.85% = 9,10,000 used as B2B cap."),
+            ("Result",
+             "Diff row in B2B/B2C detail sheets will show ✅ MATCH when the split is correct."),
+            ("", ""),
+            ("OPTION B — Combined Tally vs Govt (HSN B2B/B2C Summary sheets)", ""),
+            ("What it does",
+             "At the bottom of HSN B2B Summary and HSN B2C Summary sheets, a validation table "
+             "shows: Tally B2B + Tally B2C = Tally Combined, compared directly to Govt HSN total."),
+            ("Why this is the real proof",
+             "Since Govt HSN = B2B+B2C combined, this combined comparison is the true match test. "
+             "If Tally Combined = Govt → ✅ BALANCED — your data is correct."),
             ("", ""),
             ("HSN WATERFALL LOGIC", ""),
             ("Step 1 — Single-HSN invoice",
