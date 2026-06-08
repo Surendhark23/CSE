@@ -434,57 +434,49 @@ try:
             rows.append(spacer)
             return rows
 
-        # ── STEP 7 : WATERFALL — plain alloc rows for HSN summary ─────────────
-        def waterfall_alloc(hsn_code, df_exp, govt_hsn_agg):
-            ga = govt_hsn_agg[govt_hsn_agg["HSN"] == hsn_code]
-            if ga.empty:
-                return []
-            g = ga.iloc[0]
-            g_tot = g["Govt_Total"];  g_tax = g["Govt_Taxable"]
-            g_cg = g["Govt_CGST"];   g_sg = g["Govt_SGST"];  g_ig = g["Govt_IGST"]
-            desc = str(g["Description"]); uqc = str(g["UQC"])
+        # ── STEP 7 : BUILD HSN ALLOCATION — Tally-direct equal-split ──────────
+        # ROOT CAUSE FIX:
+        # The old waterfall_alloc used Govt HSN totals as the cap, which caused
+        # B2B/B2C HSN summary totals to NOT match B2B/B2C reconciliation totals.
+        # Reason: Govt HSN is combined (B2B+B2C) — using it as a cap for
+        # multi-HSN invoice allocation mixed B2B values into B2C and vice versa.
+        #
+        # CORRECT APPROACH:
+        # • Single-HSN invoice → assign 100% of its Tally value to that HSN
+        # • Multi-HSN invoice  → split invoice value EQUALLY by number of HSNs
+        # This ensures: SUM(HSN B2B taxable) == SUM(B2B Reconciliation taxable)
+        #               SUM(HSN B2C taxable) == SUM(B2C Reconciliation taxable)
+        # 100% guaranteed match.
 
-            inv = df_exp[df_exp["HSN"] == hsn_code].sort_values("Voucher No.").copy()
-            singles = inv[~inv["is_multi"]]
-            multis = inv[inv["is_multi"]]
+        alloc_rows = []
+        for _, r in df_exp.iterrows():
+            # For single-HSN: factor=1.0 (full value)
+            # For multi-HSN:  factor=1/n_hsn (equal split)
+            factor = 1.0 if not r["is_multi"] else (1.0 / r["n_hsn"])
 
-            s_tot = singles["Gross Total"].sum(); s_tax = singles["GST SALES"].sum()
-            s_cg = singles["CGST"].sum();          s_sg = singles["SGST"].sum()
-            n_m = len(multis)
+            # Look up Description and UQC from govt_hsn_agg
+            ga = govt_hsn_agg[govt_hsn_agg["HSN"] == r["HSN"]]
+            desc = str(ga.iloc[0]["Description"]) if not ga.empty else ""
+            uqc  = str(ga.iloc[0]["UQC"])         if not ga.empty else ""
 
-            rem_tot = round(g_tot - s_tot, 2); rem_tax = round(g_tax - s_tax, 2)
-            rem_cg = round(g_cg - s_cg, 2);   rem_sg = round(g_sg - s_sg, 2)
-            rem_ig = round(g_ig - singles["IGST"].sum(), 2)
-
-            rows = []
-            for _, r in singles.iterrows():
-                rows.append({
-                    "HSN": hsn_code, "Description": desc, "UQC": uqc,
-                    "is_b2b": r["is_b2b"],
-                    "Gross Total": round(r["Gross Total"], 2),
-                    "Taxable": round(r["GST SALES"], 2),
-                    "CGST": round(r["CGST"], 2), "SGST": round(r["SGST"], 2),
-                    "IGST": 0.0, "Quantity": r["Quantity"],
-                })
-            for _, r in multis.iterrows():
-                rows.append({
-                    "HSN": hsn_code, "Description": desc, "UQC": uqc,
-                    "is_b2b": r["is_b2b"],
-                    "Gross Total": round(rem_tot / n_m, 2) if n_m > 0 else 0,
-                    "Taxable": round(rem_tax / n_m, 2) if n_m > 0 else 0,
-                    "CGST": round(rem_cg / n_m, 2) if n_m > 0 else 0,
-                    "SGST": round(rem_sg / n_m, 2) if n_m > 0 else 0,
-                    "IGST": 0.0, "Quantity": 0,
-                })
-            return rows
-
-        all_alloc = []
-        for h in govt_hsn_agg["HSN"].tolist():
-            all_alloc.extend(waterfall_alloc(h, df_exp, govt_hsn_agg))
-        df_alloc = pd.DataFrame(all_alloc)
+            alloc_rows.append({
+                "HSN":         r["HSN"],
+                "Description": desc,
+                "UQC":         uqc,
+                "is_b2b":      r["is_b2b"],
+                "Gross Total": round(r["Gross Total"] * factor, 4),
+                "Taxable":     round(r["GST SALES"]   * factor, 4),
+                "CGST":        round(r["CGST"]         * factor, 4),
+                "SGST":        round(r["SGST"]         * factor, 4),
+                "IGST":        round(r["IGST"]         * factor, 4),
+                "Quantity":    round(r["Quantity"]     * factor, 4) if not r["is_multi"] else 0,
+            })
+        df_alloc = pd.DataFrame(alloc_rows)
 
         def build_hsn_summary(df_alloc, is_b2b):
-            df_f = df_alloc[df_alloc["is_b2b"] == is_b2b]
+            # FIXED: uses Tally-direct equal-split values so that
+            # SUM(HSN Summary Taxable) == SUM(B2B/B2C Reconciliation Taxable) — 100%
+            df_f = df_alloc[df_alloc["is_b2b"] == is_b2b].copy()
             if df_f.empty:
                 return pd.DataFrame(columns=[
                     "HSN", "Description", "UQC", "Total Quantity", "Total Value",
@@ -492,19 +484,24 @@ try:
                     "State/UT Tax Amount", "Cess Amount",
                 ])
             agg = df_f.groupby(["HSN", "Description", "UQC"]).agg(
-                Total_Quantity=("Quantity", "sum"), Total_Value=("Gross Total", "sum"),
-                Taxable_Value=("Taxable", "sum"), IGST=("IGST", "sum"),
-                CGST=("CGST", "sum"), SGST=("SGST", "sum"),
+                Total_Quantity=("Quantity",   "sum"),
+                Total_Value=  ("Gross Total", "sum"),
+                Taxable_Value=("Taxable",     "sum"),
+                IGST=         ("IGST",        "sum"),
+                CGST=         ("CGST",        "sum"),
+                SGST=         ("SGST",        "sum"),
             ).reset_index()
             rows = [{
-                "HSN": r["HSN"], "Description": r["Description"], "UQC": r["UQC"],
-                "Total Quantity": int(round(r["Total_Quantity"])),
-                "Total Value": round(r["Total_Value"], 2),
-                "Taxable Value": round(r["Taxable_Value"], 2),
-                "Integrated Tax Amount": round(r["IGST"], 2),
-                "Central Tax Amount": round(r["CGST"], 2),
-                "State/UT Tax Amount": round(r["SGST"], 2),
-                "Cess Amount": 0,
+                "HSN":                   r["HSN"],
+                "Description":           r["Description"],
+                "UQC":                   r["UQC"],
+                "Total Quantity":        int(round(r["Total_Quantity"])),
+                "Total Value":           round(r["Total_Value"],   2),
+                "Taxable Value":         round(r["Taxable_Value"], 2),
+                "Integrated Tax Amount": round(r["IGST"],          2),
+                "Central Tax Amount":    round(r["CGST"],          2),
+                "State/UT Tax Amount":   round(r["SGST"],          2),
+                "Cess Amount":           0,
             } for _, r in agg.iterrows()]
             df_out = pd.DataFrame(rows)
             num_cols = [
@@ -512,7 +509,9 @@ try:
                 "Integrated Tax Amount", "Central Tax Amount",
                 "State/UT Tax Amount", "Cess Amount",
             ]
-            total = {c: df_out[c].sum() for c in num_cols}
+            for c in num_cols:
+                df_out[c] = pd.to_numeric(df_out[c], errors="coerce").round(2)
+            total = {c: round(df_out[c].sum(), 2) for c in num_cols}
             total.update({"HSN": "TOTAL", "Description": "", "UQC": ""})
             df_out = pd.concat([df_out, pd.DataFrame([total])], ignore_index=True)
             return df_out
@@ -891,42 +890,35 @@ try:
             ("🟦 Light Blue band (HSN)", "Govt Total row — FINAL"),
             ("🟢 / 🔴 Diff row (HSN)", "0 = perfect match | non-zero = gap"),
             ("", ""),
+            ("HSN B2B / B2C SUMMARY — HOW VALUES ARE SPLIT", ""),
+            ("Guarantee",
+             "HSN B2B Summary TOTAL = B2B Reconciliation TOTAL (100% match). "
+             "HSN B2C Summary TOTAL = B2C Invoice Detail TOTAL (100% match)."),
+            ("Single-HSN invoice",
+             "Full Gross Total / Taxable / CGST / SGST assigned 100% to that HSN."),
+            ("Multi-HSN invoice",
+             "Invoice value split EQUALLY by number of unique HSNs on that invoice. "
+             "e.g. invoice with 3 HSNs → each HSN gets 1/3 of the total value."),
+            ("Why equal split?",
+             "Tally DayBook does not store per-HSN breakdowns within one invoice. "
+             "Equal split is the only lossless method that preserves the grand total exactly."),
+            ("", ""),
             ("WHY GOVT HSN ≠ B2B or B2C ALONE", ""),
             ("Key fact",
              "Govt HSN sheet is a COMBINED total (B2B + B2C). It does NOT split by customer type."),
             ("", ""),
-            ("OPTION A — Proportional Govt Split (B2B/B2C Detail sheets)", ""),
+            ("OPTION A — Proportional Govt Split (B2B/B2C HSN Detail sheets)", ""),
             ("What it does",
-             "In B2B HSN Detail / B2C HSN Detail: Govt Total is scaled by the "
-             "proportion of B2B (or B2C) taxable value vs total Tally taxable value for that HSN."),
-            ("Example",
-             "HSN 84151010: B2B = 73.85% of Tally total. Govt 12,33,042 × 73.85% = 9,10,000 used as B2B cap."),
-            ("Result",
-             "Diff row in B2B/B2C detail sheets will show ✅ MATCH when the split is correct."),
+             "In B2B HSN Detail / B2C HSN Detail: the Govt Total shown is scaled by "
+             "the B2B (or B2C) proportion of Tally taxable value for that HSN."),
             ("", ""),
             ("OPTION B — Combined Tally vs Govt (HSN B2B/B2C Summary sheets)", ""),
             ("What it does",
-             "At the bottom of HSN B2B Summary and HSN B2C Summary sheets, a validation table "
-             "shows: Tally B2B + Tally B2C = Tally Combined, compared directly to Govt HSN total."),
+             "At the bottom of HSN B2B Summary and HSN B2C Summary: a validation table "
+             "shows Tally B2B + Tally B2C = Tally Combined vs Govt HSN total."),
             ("Why this is the real proof",
              "Since Govt HSN = B2B+B2C combined, this combined comparison is the true match test. "
-             "If Tally Combined = Govt → ✅ BALANCED — your data is correct."),
-            ("", ""),
-            ("HSN WATERFALL LOGIC", ""),
-            ("Step 1 — Single-HSN invoice",
-             "Full Gross / Taxable / CGST / SGST / IGST assigned to that HSN"),
-            ("Step 2 — Multi-HSN invoice",
-             "Remaining = Govt_Total − Σ(single-invoice allocations for this HSN)"),
-            ("Step 3 — Split remaining",
-             "Remaining divided equally among multi-HSN invoices sharing this HSN"),
-            ("Step 4 — Verify",
-             "Tally Total = singles + remaining = Govt Total (always matches)"),
-            ("", ""),
-            ("Example — HSN 2903", "Govt Total = 13,570"),
-            ("", "CSES/I/074 (single) → 3,540  |  running = 3,540"),
-            ("", "CSES/I/075 (single) → 2,950  |  running = 6,490"),
-            ("", "CSES/I/087 (multi)  → 13,570 − 6,490 = 7,080"),
-            ("", "Tally Total = 3,540 + 2,950 + 7,080 = 13,570  ✅"),
+             "If Tally Combined = Govt → ✅ BALANCED."),
         ]
         for ri, (k, v) in enumerate(legend, 1):
             bold = ri == 1 or k in ("HSN WATERFALL LOGIC", "Example — HSN 2903")
